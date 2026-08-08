@@ -5,9 +5,7 @@ Side project — no cloud, no account. Everything runs through an interactive me
 
 **Stack:** .NET 9 · Playwright · Spectre.Console
 
-<p align="center">
-  <img src="docs/images/menu-main.png" alt="site-harvest main menu" width="820" />
-</p>
+![site-harvest main menu](docs/images/menu-main.png)
 
 ## Why
 
@@ -55,10 +53,6 @@ Optional data directory: `--data /path/to/data` or env `SITE_HARVEST_DATA`.
 ## Teach
 
 Teach opens a headed browser and a simple arrow-key menu: add clicks, fields, or a next-page control.
-
-<p align="center">
-  <img src="docs/images/menu-teach-actions.png" alt="Teach menu" width="820" />
-</p>
 
 After each **Add click**, you’re asked:
 
