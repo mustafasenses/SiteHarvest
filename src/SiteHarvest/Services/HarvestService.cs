@@ -198,6 +198,7 @@ public sealed class HarvestService
                     }
 
                     await PlayStepsAsync(page, suffix, ct);
+                    await WaitForPageSettledAsync(page, ct);
                     await CaptureCurrentPageAsync(page, auto, run, items, visitKey, maxItems, ct);
                 }
                 catch (Exception ex)
@@ -256,16 +257,7 @@ public sealed class HarvestService
                 break;
             }
 
-            await page.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
-            try
-            {
-                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new PageWaitForLoadStateOptions { Timeout = 5_000 });
-            }
-            catch
-            {
-            }
-
-            await page.WaitForTimeoutAsync(400);
+            await WaitForPageSettledAsync(page, ct);
             Console.WriteLine($"Page {pageIndex + 1}: capture ({page.Url})");
             await CaptureCurrentPageAsync(page, auto, run, items, visitKey: $"p{pageIndex}", maxItems, ct);
 
@@ -280,6 +272,43 @@ public sealed class HarvestService
     }
 
     private const int MaxPaginationPages = 500;
+    private const int PageSettleTimeoutMs = 30_000;
+    private const int ImageReadyTimeoutMs = 45_000;
+    private const int ImageReadyPollMs = 250;
+
+    private static async Task WaitForPageSettledAsync(IPage page, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        try
+        {
+            await page.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            await page.WaitForLoadStateAsync(
+                LoadState.Load,
+                new PageWaitForLoadStateOptions { Timeout = PageSettleTimeoutMs });
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            await page.WaitForLoadStateAsync(
+                LoadState.NetworkIdle,
+                new PageWaitForLoadStateOptions { Timeout = PageSettleTimeoutMs });
+        }
+        catch
+        {
+        }
+
+        await page.WaitForTimeoutAsync(500);
+    }
 
     private static async Task<bool> TryGoNextPageAsync(
         IPage page,
@@ -310,16 +339,7 @@ public sealed class HarvestService
                     return false;
             }
 
-            await page.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
-            try
-            {
-                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new PageWaitForLoadStateOptions { Timeout = 5_000 });
-            }
-            catch
-            {
-            }
-
-            await page.WaitForTimeoutAsync(500);
+            await WaitForPageSettledAsync(page, ct);
 
             var afterUrl = page.Url;
             var afterFp = await PageFingerprintAsync(page);
@@ -767,7 +787,7 @@ el => {
                     try
                     {
                         await loc.ScrollIntoViewIfNeededAsync();
-                        await page.WaitForTimeoutAsync(150);
+                        await WaitForLocatorImageReadyAsync(loc, ct, timeoutMs: 8_000);
                     }
                     catch
                     {
@@ -817,7 +837,7 @@ el => {
             try
             {
                 await root.ScrollIntoViewIfNeededAsync();
-                await page.WaitForTimeoutAsync(100);
+                await WaitForLocatorImageReadyAsync(root, ct, timeoutMs: 8_000);
             }
             catch
             {
@@ -851,24 +871,58 @@ el => {
         foreach (var field in auto.Fields)
         {
             types[field.Key] = field.Type;
+            var isImage = string.Equals(field.Type, FieldTypes.Image, StringComparison.OrdinalIgnoreCase);
             try
             {
-                var extracted = cardRoot != null
-                    ? await ExtractFromCardRootAsync(cardRoot, field, pageUrl)
-                    : await ExtractFromPageAsync(page, field, pageUrl);
-
-                if (string.Equals(field.Type, FieldTypes.Image, StringComparison.OrdinalIgnoreCase)
-                    && !string.IsNullOrWhiteSpace(extracted))
+                if (isImage)
                 {
+                    var extracted = await WaitForImageUrlAsync(
+                        page, cardRoot, field, pageUrl, ct, ImageReadyTimeoutMs);
+
+                    if (string.IsNullOrWhiteSpace(extracted))
+                    {
+                        Console.WriteLine(
+                            $"  Field '{field.Key}': image URL still missing after {ImageReadyTimeoutMs / 1000}s, skipping item.");
+                        return;
+                    }
+
                     if (seenImageUrls != null && !seenImageUrls.Add(extracted))
                         return;
 
                     anchor ??= extracted;
                     var local = await DownloadImageAsync(extracted, pageUrl, run.Id, field.Key, cardIndex, ct);
+                    if (local == null)
+                    {
+                        // Src may still be swapping after decode; wait and retry once more.
+                        var retryUrl = await WaitForImageUrlAsync(
+                            page, cardRoot, field, pageUrl, ct, ImageReadyTimeoutMs / 2);
+                        if (!string.IsNullOrWhiteSpace(retryUrl))
+                        {
+                            if (seenImageUrls != null
+                                && !string.Equals(retryUrl, extracted, StringComparison.OrdinalIgnoreCase)
+                                && !seenImageUrls.Add(retryUrl))
+                                return;
+
+                            extracted = retryUrl;
+                            anchor = extracted;
+                            local = await DownloadImageAsync(
+                                extracted, pageUrl, run.Id, field.Key, cardIndex, ct);
+                        }
+                    }
+
+                    if (local == null)
+                    {
+                        Console.WriteLine($"  Field '{field.Key}': download failed, skipping item.");
+                        return;
+                    }
+
                     values[field.Key] = local;
                 }
                 else
                 {
+                    var extracted = cardRoot != null
+                        ? await ExtractFromCardRootAsync(cardRoot, field, pageUrl)
+                        : await ExtractFromPageAsync(page, field, pageUrl);
                     values[field.Key] = extracted;
                     if (string.Equals(field.Type, FieldTypes.Url, StringComparison.OrdinalIgnoreCase))
                         anchor ??= extracted;
@@ -876,6 +930,12 @@ el => {
             }
             catch (Exception ex)
             {
+                if (isImage)
+                {
+                    Console.WriteLine($"  Field '{field.Key}' failed ({ex.Message}), skipping item.");
+                    return;
+                }
+
                 Console.WriteLine($"  Field '{field.Key}' left empty: {ex.Message}");
                 values[field.Key] = null;
             }
@@ -959,15 +1019,7 @@ el => {
         var t = type.ToLowerInvariant();
         if (t == FieldTypes.Image)
         {
-            var src = await loc.GetAttributeAsync("src")
-                      ?? await loc.GetAttributeAsync("data-src");
-            if (string.IsNullOrWhiteSpace(src))
-            {
-                var img = loc.Locator("img").First;
-                if (await img.CountAsync() > 0)
-                    src = await img.GetAttributeAsync("src") ?? await img.GetAttributeAsync("data-src");
-            }
-
+            var src = await loc.EvaluateAsync<string?>(PickImageUrlScript);
             return UrlHelper.ToAbsolute(src, pageUrl);
         }
 
@@ -1050,20 +1102,323 @@ el => {
     {
         try
         {
+            await WaitForPageSettledAsync(page, ct);
+
             var locs = page.Locator(imageSelector);
             var n = Math.Min(await locs.CountAsync(), 40);
             for (var i = 0; i < n; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                try { await locs.Nth(i).ScrollIntoViewIfNeededAsync(); }
+                var loc = locs.Nth(i);
+                try { await loc.ScrollIntoViewIfNeededAsync(); }
                 catch { }
-                await page.WaitForTimeoutAsync(80);
+
+                // Warm lazy-loaders; per-item capture waits for the final URL.
+                await WaitForLocatorImageReadyAsync(loc, ct, timeoutMs: 8_000);
+            }
+
+            try
+            {
+                await page.EvaluateAsync(PromoteLazyImagesScript, imageSelector);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                await page.WaitForLoadStateAsync(
+                    LoadState.NetworkIdle,
+                    new PageWaitForLoadStateOptions { Timeout = PageSettleTimeoutMs });
+            }
+            catch
+            {
             }
         }
         catch
         {
         }
     }
+
+    private static async Task<string?> WaitForImageUrlAsync(
+        IPage page,
+        ILocator? cardRoot,
+        FieldMapping field,
+        string pageUrl,
+        CancellationToken ct,
+        int timeoutMs)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddMilliseconds(timeoutMs);
+        string? last = null;
+
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var target = await ResolveImageLocatorAsync(page, cardRoot, field);
+            if (target != null)
+            {
+                try { await target.ScrollIntoViewIfNeededAsync(); }
+                catch { }
+
+                await WaitForLocatorImageReadyAsync(
+                    target, ct, timeoutMs: Math.Min(ImageReadyPollMs * 8, 2_000));
+            }
+            else if (cardRoot != null)
+            {
+                try { await cardRoot.ScrollIntoViewIfNeededAsync(); }
+                catch { }
+
+                await WaitForLocatorImageReadyAsync(
+                    cardRoot, ct, timeoutMs: Math.Min(ImageReadyPollMs * 8, 2_000));
+            }
+
+            last = cardRoot != null
+                ? await ExtractFromCardRootAsync(cardRoot, field, pageUrl)
+                : await ExtractFromPageAsync(page, field, pageUrl);
+
+            if (!string.IsNullOrWhiteSpace(last))
+                return last;
+
+            await Task.Delay(ImageReadyPollMs, ct);
+        }
+
+        return last;
+    }
+
+    private static async Task<ILocator?> ResolveImageLocatorAsync(
+        IPage page,
+        ILocator? cardRoot,
+        FieldMapping field)
+    {
+        try
+        {
+            if (cardRoot != null)
+            {
+                var leaf = SelectorHelper.LeafSelector(field.Selector);
+                if (!string.IsNullOrWhiteSpace(leaf))
+                {
+                    var scoped = cardRoot.Locator(leaf).First;
+                    if (await scoped.CountAsync() > 0)
+                        return scoped;
+                }
+
+                var nested = cardRoot.Locator("img").First;
+                if (await nested.CountAsync() > 0)
+                    return nested;
+
+                return cardRoot;
+            }
+
+            var selector = SelectorHelper.GeneralizeListSelector(field.Selector) ?? field.Selector;
+            var loc = page.Locator(selector).First;
+            return await loc.CountAsync() > 0 ? loc : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static async Task WaitForLocatorImageReadyAsync(
+        ILocator loc,
+        CancellationToken ct,
+        int timeoutMs = ImageReadyTimeoutMs)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var ready = await loc.EvaluateAsync<bool>(ImageReadyScript);
+                if (ready)
+                    return;
+            }
+            catch
+            {
+                // Element may be re-rendered while lazy content swaps — keep polling.
+            }
+
+            await Task.Delay(ImageReadyPollMs, ct);
+        }
+    }
+
+    /// <summary>
+    /// Resolve a real (non-placeholder) image URL from an element or nested img.
+    /// Also promotes common lazy-load attributes onto src so the browser starts loading.
+    /// </summary>
+    private const string PickImageUrlScript = """
+el => {
+  function resolveImg(node) {
+    if (!node) return null;
+    if (node.tagName === 'IMG') return node;
+    if (node.tagName === 'PICTURE')
+      return (node.querySelector && node.querySelector('img')) || null;
+    return (node.querySelector && node.querySelector('img, picture img')) || null;
+  }
+  function isPlaceholder(url) {
+    if (!url || typeof url !== 'string') return true;
+    const u = url.trim();
+    if (!u) return true;
+    if (u.startsWith('data:')) return true;
+    const path = u.split('?')[0].split('#')[0];
+    const base = path.substring(path.lastIndexOf('/') + 1).toLowerCase();
+    if (!base) return true;
+    if (/^(spacer|pixel|blank|placeholder|loading|transparent|lazy[-_]?load|1x1)(\.|$)/i.test(base))
+      return true;
+    return false;
+  }
+  function fromSrcset(value) {
+    if (!value || typeof value !== 'string') return null;
+    const first = value.split(',')[0]?.trim().split(/\s+/)[0];
+    return first || null;
+  }
+  function lazyCandidates(img) {
+    return [
+      img.getAttribute('data-src'),
+      img.getAttribute('data-original'),
+      img.getAttribute('data-lazy'),
+      img.getAttribute('data-lazy-src'),
+      img.getAttribute('data-url'),
+      img.getAttribute('data-image'),
+      img.getAttribute('data-img'),
+      img.getAttribute('data-large_image'),
+      fromSrcset(img.getAttribute('data-srcset')),
+      fromSrcset(img.getAttribute('data-lazy-srcset')),
+    ];
+  }
+  function pickUrl(img) {
+    if (!img) return null;
+    const candidates = [
+      img.currentSrc, img.src,
+      ...lazyCandidates(img),
+      fromSrcset(img.getAttribute('srcset')),
+    ];
+    for (const c of candidates) {
+      if (c && typeof c === 'string' && !isPlaceholder(c)) return c.trim();
+    }
+    return null;
+  }
+  function promoteLazy(img) {
+    if (!img) return;
+    for (const lazy of lazyCandidates(img)) {
+      if (lazy && !isPlaceholder(lazy) && isPlaceholder(img.getAttribute('src') || img.src || '')) {
+        try { img.src = lazy; break; } catch (e) {}
+      }
+    }
+  }
+  const img = resolveImg(el);
+  promoteLazy(img);
+  return pickUrl(img);
+}
+""";
+
+    /// <summary>
+    /// True when the locator (or nested img) has a real, non-placeholder URL.
+    /// Prefer decoded images (naturalWidth &gt; 0) but accept a real URL so HTTP download can proceed.
+    /// </summary>
+    private const string ImageReadyScript = """
+el => {
+  function resolveImg(node) {
+    if (!node) return null;
+    if (node.tagName === 'IMG') return node;
+    if (node.tagName === 'PICTURE')
+      return (node.querySelector && node.querySelector('img')) || null;
+    return (node.querySelector && node.querySelector('img, picture img')) || null;
+  }
+  function isPlaceholder(url) {
+    if (!url || typeof url !== 'string') return true;
+    const u = url.trim();
+    if (!u) return true;
+    if (u.startsWith('data:')) return true;
+    const path = u.split('?')[0].split('#')[0];
+    const base = path.substring(path.lastIndexOf('/') + 1).toLowerCase();
+    if (!base) return true;
+    if (/^(spacer|pixel|blank|placeholder|loading|transparent|lazy[-_]?load|1x1)(\.|$)/i.test(base))
+      return true;
+    return false;
+  }
+  function fromSrcset(value) {
+    if (!value || typeof value !== 'string') return null;
+    const first = value.split(',')[0]?.trim().split(/\s+/)[0];
+    return first || null;
+  }
+  function lazyCandidates(img) {
+    return [
+      img.getAttribute('data-src'),
+      img.getAttribute('data-original'),
+      img.getAttribute('data-lazy'),
+      img.getAttribute('data-lazy-src'),
+      img.getAttribute('data-url'),
+      img.getAttribute('data-image'),
+      img.getAttribute('data-img'),
+      img.getAttribute('data-large_image'),
+      fromSrcset(img.getAttribute('data-srcset')),
+      fromSrcset(img.getAttribute('data-lazy-srcset')),
+    ];
+  }
+  function pickUrl(img) {
+    if (!img) return null;
+    const candidates = [
+      img.currentSrc, img.src,
+      ...lazyCandidates(img),
+      fromSrcset(img.getAttribute('srcset')),
+    ];
+    for (const c of candidates) {
+      if (c && typeof c === 'string' && !isPlaceholder(c)) return c.trim();
+    }
+    return null;
+  }
+  const img = resolveImg(el);
+  if (!img) return false;
+  for (const lazy of lazyCandidates(img)) {
+    if (lazy && !isPlaceholder(lazy) && isPlaceholder(img.getAttribute('src') || img.src || '')) {
+      try { img.src = lazy; break; } catch (e) {}
+    }
+  }
+  // Real URL is enough to extract/download; decoded pixels are a bonus.
+  return !!pickUrl(img);
+}
+""";
+
+    private const string PromoteLazyImagesScript = """
+(selector) => {
+  function isPlaceholder(url) {
+    if (!url || typeof url !== 'string') return true;
+    const u = url.trim();
+    if (!u || u.startsWith('data:')) return true;
+    const path = u.split('?')[0].split('#')[0];
+    const base = path.substring(path.lastIndexOf('/') + 1).toLowerCase();
+    if (!base) return true;
+    return /^(spacer|pixel|blank|placeholder|loading|transparent|lazy[-_]?load|1x1)(\.|$)/i.test(base);
+  }
+  function fromSrcset(value) {
+    if (!value || typeof value !== 'string') return null;
+    return value.split(',')[0]?.trim().split(/\s+/)[0] || null;
+  }
+  let nodes = [];
+  try { nodes = Array.from(document.querySelectorAll(selector)); } catch (e) { return 0; }
+  let promoted = 0;
+  for (const node of nodes) {
+    const img = node.tagName === 'IMG' ? node
+      : (node.querySelector && node.querySelector('img, picture img'));
+    if (!img) continue;
+    const lazy = img.getAttribute('data-src')
+      || img.getAttribute('data-original')
+      || img.getAttribute('data-lazy')
+      || img.getAttribute('data-lazy-src')
+      || img.getAttribute('data-url')
+      || img.getAttribute('data-image')
+      || fromSrcset(img.getAttribute('data-srcset'))
+      || fromSrcset(img.getAttribute('data-lazy-srcset'));
+    if (lazy && !isPlaceholder(lazy) && isPlaceholder(img.getAttribute('src') || img.src || '')) {
+      try { img.src = lazy; promoted++; } catch (e) {}
+    }
+  }
+  return promoted;
+}
+""";
 
     private sealed class CardExtractDto
     {
@@ -1105,17 +1460,47 @@ el => {
     return best || queryIn(start, leafSel) || queryIn(start, fullSel);
   }
 
+  function isPlaceholder(url) {
+    if (!url || typeof url !== 'string') return true;
+    const u = url.trim();
+    if (!u) return true;
+    if (u.startsWith('data:')) return true;
+    const path = u.split('?')[0].split('#')[0];
+    const base = path.substring(path.lastIndexOf('/') + 1).toLowerCase();
+    if (!base) return true;
+    if (/^(spacer|pixel|blank|placeholder|loading|transparent|lazy[-_]?load|1x1)(\.|$)/i.test(base))
+      return true;
+    return false;
+  }
+  function fromSrcset(value) {
+    if (!value || typeof value !== 'string') return null;
+    return value.split(',')[0]?.trim().split(/\s+/)[0] || null;
+  }
   function pickImg(img) {
     if (!img) return null;
-    const candidates = [
-      img.currentSrc, img.src,
+    const lazyList = [
       img.getAttribute('data-src'),
       img.getAttribute('data-original'),
       img.getAttribute('data-lazy'),
+      img.getAttribute('data-lazy-src'),
       img.getAttribute('data-url'),
+      img.getAttribute('data-image'),
+      img.getAttribute('data-img'),
+      fromSrcset(img.getAttribute('data-srcset')),
+      fromSrcset(img.getAttribute('data-lazy-srcset')),
+    ];
+    for (const lazy of lazyList) {
+      if (lazy && !isPlaceholder(lazy) && isPlaceholder(img.getAttribute('src') || img.src || '')) {
+        try { img.src = lazy; break; } catch (e) {}
+      }
+    }
+    const candidates = [
+      img.currentSrc, img.src,
+      ...lazyList,
+      fromSrcset(img.getAttribute('srcset')),
     ];
     for (const c of candidates) {
-      if (c && typeof c === 'string' && c.trim() && !c.startsWith('data:')) return c.trim();
+      if (c && typeof c === 'string' && !isPlaceholder(c)) return c.trim();
     }
     return null;
   }
