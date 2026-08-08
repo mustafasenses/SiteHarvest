@@ -70,6 +70,8 @@ After each **Add click**, you’re asked:
 You can flip the last click later via the menu.  
 Teach stores only `key` + `type` + `selector` (no live values).
 
+**Login / cookies:** Playwright starts a fresh browser, so your normal Chrome session is not used. Log in during **Teach**, then **Save login session** (or Save). Harvest loads that file for the same site — works headless too.
+
 ## Data layout
 
 Default root: `<repo>/data` (override with `--data` or `SITE_HARVEST_DATA`).  
@@ -79,6 +81,7 @@ Default root: `<repo>/data` (override with `--data` or `SITE_HARVEST_DATA`).
 data/
   sites/{id}.json
   automations/{id}.json
+  sessions/{siteId}.json   # saved login cookies (local only)
   runs/{id}/
     run.json
     items.json
@@ -120,6 +123,7 @@ CI runs the same on push/PR (GitHub Actions).
 - **Local JSON store** — easy to inspect and zip; not a multi-user backend
 - **Selectors, not scraped values, in teach** — automations stay reusable
 - **Missing fields → null** — one bad card should not kill the run
+- **Login sessions** — cookies stay under `data/sessions/` (gitignored with `data/`); do not share them
 
 ## Disclaimer
 

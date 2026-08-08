@@ -49,7 +49,16 @@ public sealed class HarvestService
             using var playwright = await Playwright.CreateAsync();
             await using var browser = await playwright.Chromium.LaunchAsync(
                 PlaywrightFactory.LaunchOptions(headless));
-            var page = await browser.NewPageAsync(PlaywrightFactory.PageOptions());
+            var sessionPath = _store.SessionPath(auto.SiteId);
+            if (_store.HasSession(auto.SiteId))
+                Console.WriteLine($"Using saved login session for site {auto.SiteId}");
+            else
+                Console.WriteLine("No saved login session (fresh browser).");
+
+            await using var context = await browser.NewContextAsync(
+                PlaywrightFactory.ContextOptions(
+                    _store.HasSession(auto.SiteId) ? sessionPath : null));
+            var page = await context.NewPageAsync();
 
             await page.GotoAsync(auto.StartUrl, new PageGotoOptions
             {
@@ -235,6 +244,15 @@ public sealed class HarvestService
                 break;
 
             await page.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+            try
+            {
+                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new PageWaitForLoadStateOptions { Timeout = 5_000 });
+            }
+            catch
+            {
+            }
+
+            await page.WaitForTimeoutAsync(400);
             Console.WriteLine($"Page {pageIndex + 1}: capture ({page.Url})");
             await CaptureCurrentPageAsync(page, auto, run, items, visitKey: $"p{pageIndex}", maxItems, ct);
 
@@ -327,46 +345,106 @@ public sealed class HarvestService
 
         var imageField = auto.Fields.FirstOrDefault(f =>
             string.Equals(f.Type, FieldTypes.Image, StringComparison.OrdinalIgnoreCase));
+        if (imageField != null)
+        {
+            var prepareSel = SelectorHelper.GeneralizeListSelector(imageField.Selector)
+                             ?? imageField.Selector;
+            await PrepareMediaAsync(page, prepareSel, ct);
+        }
 
+        // Prefer repeating roots from taught selector structure (all fields).
+        var cardSelector = SelectorHelper.InferRepeatingCardSelector(auto.Fields.Select(f => f.Selector));
+        if (cardSelector != null)
+        {
+            var cards = page.Locator(cardSelector);
+            var cardCount = await cards.CountAsync();
+            if (cardCount > 0)
+            {
+                await CaptureEachAsync(
+                    page, auto, run, items, visitKey, cards, cardCount, maxItems, ct);
+                return;
+            }
+        }
+
+        // Fallback: generalized image field matches (taught image selector).
         if (imageField != null)
         {
             var imageSelector = SelectorHelper.GeneralizeListSelector(imageField.Selector)
                                 ?? imageField.Selector;
-            await PrepareMediaAsync(page, imageSelector, ct);
-
             var locators = page.Locator(imageSelector);
             var count = await locators.CountAsync();
-            if (count == 0)
+            if (count > 1)
             {
-                await CaptureOneAsync(page, auto, run, items, visitKey, cardIndex: 0, imageLocator: null, maxItems, ct);
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (var i = 0; i < count; i++)
+                {
+                    if (ReachedMax(items, maxItems))
+                        break;
+                    ct.ThrowIfCancellationRequested();
+
+                    var loc = locators.Nth(i);
+                    try
+                    {
+                        await loc.ScrollIntoViewIfNeededAsync();
+                        await page.WaitForTimeoutAsync(150);
+                    }
+                    catch
+                    {
+                    }
+
+                    await CaptureOneAsync(
+                        page, auto, run, items, $"{visitKey}:{i}", i, loc, maxItems, ct, seen);
+                }
+
                 return;
             }
+        }
 
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            for (var i = 0; i < count; i++)
-            {
-                if (ReachedMax(items, maxItems))
-                    break;
-                ct.ThrowIfCancellationRequested();
-
-                var loc = locators.Nth(i);
-                try
-                {
-                    await loc.ScrollIntoViewIfNeededAsync();
-                    await page.WaitForTimeoutAsync(150);
-                }
-                catch
-                {
-                }
-
-                await CaptureOneAsync(
-                    page, auto, run, items, $"{visitKey}:{i}", i, loc, maxItems, ct, seen);
-            }
-
+        // Fallback: each match of the first taught field = one item.
+        var driver = auto.Fields[0];
+        var driverSel = SelectorHelper.GeneralizeListSelector(driver.Selector) ?? driver.Selector;
+        var driverLocs = page.Locator(driverSel);
+        var driverCount = await driverLocs.CountAsync();
+        if (driverCount > 1)
+        {
+            await CaptureEachAsync(
+                page, auto, run, items, visitKey, driverLocs, driverCount, maxItems, ct);
             return;
         }
 
-        await CaptureOneAsync(page, auto, run, items, visitKey, 0, imageLocator: null, maxItems, ct);
+        await CaptureOneAsync(page, auto, run, items, visitKey, 0, cardRoot: null, maxItems, ct);
+    }
+
+    private async Task CaptureEachAsync(
+        IPage page,
+        AutomationRecord auto,
+        RunRecord run,
+        List<HarvestItem> items,
+        string visitKey,
+        ILocator roots,
+        int count,
+        int? maxItems,
+        CancellationToken ct)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            if (ReachedMax(items, maxItems))
+                break;
+            ct.ThrowIfCancellationRequested();
+
+            var root = roots.Nth(i);
+            try
+            {
+                await root.ScrollIntoViewIfNeededAsync();
+                await page.WaitForTimeoutAsync(100);
+            }
+            catch
+            {
+            }
+
+            await CaptureOneAsync(
+                page, auto, run, items, $"{visitKey}:{i}", i, cardRoot: root, maxItems, ct);
+        }
     }
 
     private async Task CaptureOneAsync(
@@ -376,7 +454,7 @@ public sealed class HarvestService
         List<HarvestItem> items,
         string visitKey,
         int cardIndex,
-        ILocator? imageLocator,
+        ILocator? cardRoot,
         int? maxItems,
         CancellationToken ct,
         HashSet<string>? seenImageUrls = null)
@@ -394,8 +472,8 @@ public sealed class HarvestService
             types[field.Key] = field.Type;
             try
             {
-                var extracted = imageLocator != null
-                    ? await ExtractFromCardAsync(imageLocator, field, pageUrl)
+                var extracted = cardRoot != null
+                    ? await ExtractFromCardRootAsync(cardRoot, field, pageUrl)
                     : await ExtractFromPageAsync(page, field, pageUrl);
 
                 if (string.Equals(field.Type, FieldTypes.Image, StringComparison.OrdinalIgnoreCase)
@@ -444,14 +522,45 @@ public sealed class HarvestService
         return await ReadLocatorAsync(loc, field.Type, pageUrl);
     }
 
-    private static async Task<string?> ExtractFromCardAsync(
-        ILocator imageLocator,
+    private static async Task<string?> ExtractFromCardRootAsync(
+        ILocator cardRoot,
         FieldMapping field,
         string pageUrl)
     {
-        var payload = await imageLocator.EvaluateAsync<CardExtractDto?>(
+        // Prefer leaf selector scoped to this card (full page paths never match inside a card).
+        var leaf = SelectorHelper.LeafSelector(field.Selector);
+        if (!string.IsNullOrWhiteSpace(leaf))
+        {
+            var loc = cardRoot.Locator(leaf).First;
+            if (await loc.CountAsync() > 0)
+                return await ReadLocatorAsync(loc, field.Type, pageUrl);
+
+            // Card root may already be the field node (LCP ended at the leaf).
+            try
+            {
+                var isSelf = await cardRoot.EvaluateAsync<bool>(
+                    "(el, sel) => { try { return el.matches(sel); } catch (e) { return false; } }",
+                    leaf);
+                if (isSelf)
+                    return await ReadLocatorAsync(cardRoot, field.Type, pageUrl);
+            }
+            catch
+            {
+            }
+        }
+
+        return await ExtractFromCardAsync(cardRoot, field, pageUrl);
+    }
+
+    private static async Task<string?> ExtractFromCardAsync(
+        ILocator cardRoot,
+        FieldMapping field,
+        string pageUrl)
+    {
+        var leaf = SelectorHelper.LeafSelector(field.Selector) ?? field.Selector;
+        var payload = await cardRoot.EvaluateAsync<CardExtractDto?>(
             CardScopedScript,
-            new { selector = field.Selector, type = field.Type });
+            new { selector = field.Selector, leaf, type = field.Type });
 
         if (payload == null)
             return null;
@@ -583,23 +692,36 @@ public sealed class HarvestService
     private const string CardScopedScript = """
 (el, args) => {
   const selector = (args && args.selector) || '';
+  const leaf = (args && args.leaf) || '';
   const type = ((args && args.type) || 'text').toLowerCase();
 
-  function findCard(node) {
-    let cur = node;
-    for (let depth = 0; depth < 10 && cur; depth++) {
-      const cls = (cur.className && typeof cur.className === 'string') ? cur.className.toLowerCase() : '';
-      const tag = (cur.tagName || '').toLowerCase();
-      if (
-        tag === 'article' || tag === 'li' ||
-        cls.includes('product') || cls.includes('card') || cls.includes('item') ||
-        cls.includes('urun') || cls.includes('seri') || cls.includes('tile')
-      ) {
-        return cur;
+  function queryIn(root, sel) {
+    if (!sel || !root || !root.querySelector) return null;
+    try { return root.querySelector(sel); } catch (e) { return null; }
+  }
+
+  // Walk up from the taught node; prefer the smallest ancestor where the leaf matches once.
+  function resolveNode(start, fullSel, leafSel) {
+    let cur = start;
+    let best = null;
+    for (let depth = 0; depth < 15 && cur; depth++) {
+      try {
+        if (leafSel && cur.matches && cur.matches(leafSel)) return cur;
+      } catch (e) {}
+
+      let hit = queryIn(cur, fullSel) || queryIn(cur, leafSel);
+      if (hit) {
+        let count = 0;
+        try {
+          count = leafSel ? cur.querySelectorAll(leafSel).length
+            : (fullSel ? cur.querySelectorAll(fullSel).length : 0);
+        } catch (e) { count = hit ? 1 : 0; }
+        if (count === 1) best = hit;
+        if (count > 1) break;
       }
       cur = cur.parentElement;
     }
-    return node.parentElement || node;
+    return best || queryIn(start, leafSel) || queryIn(start, fullSel);
   }
 
   function pickImg(img) {
@@ -617,14 +739,11 @@ public sealed class HarvestService
     return null;
   }
 
-  const card = findCard(el);
-  let node = null;
-  try { node = selector ? card.querySelector(selector) : null; } catch (e) { node = null; }
+  const node = resolveNode(el, selector, leaf);
 
   if (type === 'image') {
     const img = (node && (node.tagName === 'IMG' ? node : node.querySelector && node.querySelector('img')))
-      || (el.tagName === 'IMG' ? el : null)
-      || (card.querySelector && card.querySelector('img'));
+      || (el.tagName === 'IMG' ? el : null);
     return { value: pickImg(img) };
   }
 

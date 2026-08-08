@@ -16,6 +16,17 @@ public static class PlaywrightFactory
         ],
     };
 
+    public static BrowserNewContextOptions ContextOptions(string? storageStatePath = null)
+    {
+        var opts = new BrowserNewContextOptions
+        {
+            ViewportSize = new ViewportSize { Width = 1280, Height = 720 },
+        };
+        if (!string.IsNullOrWhiteSpace(storageStatePath) && File.Exists(storageStatePath))
+            opts.StorageStatePath = storageStatePath;
+        return opts;
+    }
+
     public static BrowserNewPageOptions PageOptions() => new()
     {
         ViewportSize = new ViewportSize { Width = 1280, Height = 720 },

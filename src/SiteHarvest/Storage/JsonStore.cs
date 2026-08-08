@@ -26,15 +26,31 @@ public sealed class JsonStore
         SitesDir = Path.Combine(DataRoot, "sites");
         AutomationsDir = Path.Combine(DataRoot, "automations");
         RunsDir = Path.Combine(DataRoot, "runs");
+        SessionsDir = Path.Combine(DataRoot, "sessions");
         Directory.CreateDirectory(SitesDir);
         Directory.CreateDirectory(AutomationsDir);
         Directory.CreateDirectory(RunsDir);
+        Directory.CreateDirectory(SessionsDir);
     }
 
     public string DataRoot { get; }
     public string SitesDir { get; }
     public string AutomationsDir { get; }
     public string RunsDir { get; }
+    public string SessionsDir { get; }
+
+    public string SessionPath(string siteId) =>
+        Path.Combine(SessionsDir, $"{siteId}.json");
+
+    public bool HasSession(string siteId) =>
+        File.Exists(SessionPath(siteId));
+
+    public void DeleteSession(string siteId)
+    {
+        var path = SessionPath(siteId);
+        if (File.Exists(path))
+            File.Delete(path);
+    }
 
     public static JsonStore CreateDefault()
     {

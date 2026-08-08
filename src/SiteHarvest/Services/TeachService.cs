@@ -20,6 +20,7 @@ public sealed class TeachService
         MarkNextPage,
         ClearNextPage,
         ToggleRepeat,
+        SaveSession,
         UndoStep,
         UndoField,
         Status,
@@ -47,11 +48,26 @@ public sealed class TeachService
 
         Term.InfoMsg("Opening browser…");
         Term.Hint("Use the menu to add clicks and fields. Say Yes if a click should run for every list item.");
+        if (_store.HasSession(auto.SiteId))
+            Term.Hint("Saved login for this site will be loaded.");
+        else
+            Term.Hint("Need login? Sign in here, then choose Save login session.");
 
         using var playwright = await Playwright.CreateAsync();
         await using var browser = await playwright.Chromium.LaunchAsync(
             PlaywrightFactory.LaunchOptions(headless: false));
-        var page = await browser.NewPageAsync(PlaywrightFactory.PageOptions());
+        var sessionPath = _store.SessionPath(auto.SiteId);
+        await using var context = await browser.NewContextAsync(
+            PlaywrightFactory.ContextOptions(
+                _store.HasSession(auto.SiteId) ? sessionPath : null));
+        var page = await context.NewPageAsync();
+
+        async Task SaveLoginSessionAsync()
+        {
+            Directory.CreateDirectory(_store.SessionsDir);
+            await context.StorageStateAsync(new BrowserContextStorageStateOptions { Path = sessionPath });
+            Term.Success("Login session saved for this site.");
+        }
 
         var pickLock = new object();
         string? pendingMode = null;
@@ -159,6 +175,10 @@ public sealed class TeachService
                                 : "Last click: once only.");
                         break;
 
+                    case MenuAction.SaveSession:
+                        await SaveLoginSessionAsync();
+                        break;
+
                     case MenuAction.UndoStep:
                         if (auto.Steps.Count == 0)
                         {
@@ -191,6 +211,7 @@ public sealed class TeachService
 
                     case MenuAction.Save:
                         _store.SaveAutomation(auto);
+                        await SaveLoginSessionAsync();
                         dirty = false;
                         Term.Success("Saved.");
                         break;
@@ -199,8 +220,12 @@ public sealed class TeachService
                         if (dirty && Term.Confirm("You have unsaved changes. Save?", defaultValue: true))
                         {
                             _store.SaveAutomation(auto);
+                            dirty = false;
                             Term.Success("Saved.");
                         }
+
+                        if (Term.Confirm("Also save login session for harvest?", defaultValue: true))
+                            await SaveLoginSessionAsync();
 
                         return;
                 }
@@ -251,14 +276,15 @@ public sealed class TeachService
         }
     }
 
-    private static void PrintHud(AutomationRecord auto, bool dirty)
+    private void PrintHud(AutomationRecord auto, bool dirty)
     {
         var repeat = auto.Steps.Any(s => s.ListBranch);
         AnsiConsole.MarkupLine(
             $"[{Term.Muted}]steps[/] [bold]{auto.Steps.Count}[/]  " +
             $"[{Term.Muted}]fields[/] [bold]{auto.Fields.Count}[/]  " +
             $"[{Term.Muted}]pagination[/] {(auto.HasPagination ? $"[{Term.Ok}]yes[/]" : $"[{Term.Muted}]no[/]")}  " +
-            $"[{Term.Muted}]repeat click[/] {(repeat ? $"[{Term.Ok}]yes[/]" : $"[{Term.Muted}]no[/]")}" +
+            $"[{Term.Muted}]repeat click[/] {(repeat ? $"[{Term.Ok}]yes[/]" : $"[{Term.Muted}]no[/]")}  " +
+            $"[{Term.Muted}]login[/] {(_store.HasSession(auto.SiteId) ? $"[{Term.Ok}]saved[/]" : $"[{Term.Muted}]none[/]")}" +
             (dirty ? $"  [{Term.Warn}]● unsaved[/]" : ""));
     }
 
@@ -282,8 +308,9 @@ public sealed class TeachService
 
         yield return new MenuItem(MenuAction.UndoStep, "Undo last step", "");
         yield return new MenuItem(MenuAction.UndoField, "Undo last field", "");
+        yield return new MenuItem(MenuAction.SaveSession, "Save login session", "cookies for harvest");
         yield return new MenuItem(MenuAction.Status, "Show status", "");
-        yield return new MenuItem(MenuAction.Save, "Save", "");
+        yield return new MenuItem(MenuAction.Save, "Save", "automation + login");
         yield return new MenuItem(MenuAction.Finish, "Done", "quit");
     }
 
@@ -302,7 +329,7 @@ public sealed class TeachService
         AnsiConsole.MarkupLine(
             $"[{Term.Muted}]Selected:[/] {Term.Escape(Truncate(clickEv.Selector!, 70))}");
         var repeat = Term.Confirm(
-            "Repeat this click for every list item? (e.g. open each product detail)",
+            "Repeat this click for every list item? (e.g. open each detail page)",
             defaultValue: guess);
 
         if (repeat)
@@ -441,7 +468,7 @@ public sealed class TeachService
 """, mode);
     }
 
-    private static void PrintStatus(AutomationRecord auto)
+    private void PrintStatus(AutomationRecord auto)
     {
         AnsiConsole.MarkupLine($"[{Term.Muted}]StartUrl[/] {Term.Escape(auto.StartUrl)}");
 
@@ -487,6 +514,8 @@ public sealed class TeachService
         AnsiConsole.MarkupLine(
             $"[{Term.Muted}]Pagination[/] {(auto.HasPagination ? $"[{Term.Ok}]yes[/]" : "no")}  " +
             $"[{Term.Muted}]next[/] {Term.Escape(auto.NextPageSelector ?? "—")}");
+        AnsiConsole.MarkupLine(
+            $"[{Term.Muted}]Login session[/] {(_store.HasSession(auto.SiteId) ? $"[{Term.Ok}]saved[/]" : $"[{Term.Muted}]none[/]")}");
     }
 
     private static string Truncate(string s, int max) =>
