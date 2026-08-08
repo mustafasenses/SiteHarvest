@@ -1,0 +1,28 @@
+# Build
+bin/
+obj/
+*.user
+*.suo
+*.cache
+
+# Local harvest data & exports (never commit scraped content)
+data/
+*.zip
+exports/
+
+# Test / coverage
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# IDE / OS
+.vs/
+.idea/
+*.swp
+.DS_Store
+*~
+
+# Env
+.env
+.env.*
