@@ -1,4 +1,5 @@
 using System.Net.Http;
+using System.Text.RegularExpressions;
 using Microsoft.Playwright;
 using SiteHarvest.Browser;
 using SiteHarvest.Helpers;
@@ -122,11 +123,17 @@ public sealed class HarvestService
                            ?? branchStep.Selector;
 
         var pageIndex = 0;
+        var visitedPages = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { NormalizePageUrl(listingUrl) };
         while (true)
         {
             ct.ThrowIfCancellationRequested();
             if (ReachedMax(items, maxItems))
                 break;
+            if (pageIndex >= MaxPaginationPages)
+            {
+                Console.WriteLine($"Stopped: reached pagination safety limit ({MaxPaginationPages} pages).");
+                break;
+            }
 
             await page.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
             var cards = page.Locator(cardSelector);
@@ -220,7 +227,7 @@ public sealed class HarvestService
             if (ReachedMax(items, maxItems))
                 break;
 
-            if (!await TryGoNextPageAsync(page, auto, ct))
+            if (!await TryGoNextPageAsync(page, auto, visitedPages, ct))
                 break;
 
             listingUrl = page.Url;
@@ -237,11 +244,17 @@ public sealed class HarvestService
         CancellationToken ct)
     {
         var pageIndex = 0;
+        var visitedPages = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { NormalizePageUrl(page.Url) };
         while (true)
         {
             ct.ThrowIfCancellationRequested();
             if (ReachedMax(items, maxItems))
                 break;
+            if (pageIndex >= MaxPaginationPages)
+            {
+                Console.WriteLine($"Stopped: reached pagination safety limit ({MaxPaginationPages} pages).");
+                break;
+            }
 
             await page.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
             try
@@ -259,37 +272,131 @@ public sealed class HarvestService
             if (ReachedMax(items, maxItems))
                 break;
 
-            if (!await TryGoNextPageAsync(page, auto, ct))
+            if (!await TryGoNextPageAsync(page, auto, visitedPages, ct))
                 break;
 
             pageIndex++;
         }
     }
 
+    private const int MaxPaginationPages = 500;
+
     private static async Task<bool> TryGoNextPageAsync(
         IPage page,
         AutomationRecord auto,
+        HashSet<string> visitedPages,
         CancellationToken ct)
     {
         if (!auto.HasPagination || string.IsNullOrWhiteSpace(auto.NextPageSelector))
             return false;
 
         ct.ThrowIfCancellationRequested();
-        var next = page.Locator(auto.NextPageSelector).First;
+        var selector = auto.NextPageSelector;
+        var beforeUrl = page.Url;
+        var beforeFp = await PageFingerprintAsync(page);
+
+        try
+        {
+            var numbered = await TryClickNumberedNextAsync(page, selector);
+            if (numbered == NumberedPageResult.LastPage)
+            {
+                Console.WriteLine("Pagination: last page reached (no higher page number).");
+                return false;
+            }
+
+            if (numbered == NumberedPageResult.NotApplicable)
+            {
+                if (!await TryClickNextControlAsync(page, selector))
+                    return false;
+            }
+
+            await page.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+            try
+            {
+                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new PageWaitForLoadStateOptions { Timeout = 5_000 });
+            }
+            catch
+            {
+            }
+
+            await page.WaitForTimeoutAsync(500);
+
+            var afterUrl = page.Url;
+            var afterFp = await PageFingerprintAsync(page);
+            if (string.Equals(beforeFp, afterFp, StringComparison.Ordinal)
+                && string.Equals(NormalizePageUrl(beforeUrl), NormalizePageUrl(afterUrl), StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("Pagination: page did not change after next — stopping.");
+                return false;
+            }
+
+            var normalized = NormalizePageUrl(afterUrl);
+            if (!visitedPages.Add(normalized))
+            {
+                Console.WriteLine("Pagination: already visited this URL — stopping.");
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Pagination: next failed ({ex.Message}) — stopping.");
+            return false;
+        }
+    }
+
+    private enum NumberedPageResult
+    {
+        Advanced,
+        LastPage,
+        NotApplicable,
+    }
+
+    /// <summary>
+    /// When the taught control sits in a numeric pager (1 2 3 …), click current+1.
+    /// Works without a dedicated "next" arrow.
+    /// </summary>
+    private static async Task<NumberedPageResult> TryClickNumberedNextAsync(IPage page, string taughtSelector)
+    {
+        PaginationClickDto? result;
+        try
+        {
+            result = await page.EvaluateAsync<PaginationClickDto?>(NumberedPaginationScript, taughtSelector);
+        }
+        catch
+        {
+            return NumberedPageResult.NotApplicable;
+        }
+
+        if (result == null || string.Equals(result.Mode, "control", StringComparison.OrdinalIgnoreCase))
+            return NumberedPageResult.NotApplicable;
+
+        if (result.Ok)
+        {
+            Console.WriteLine($"Pagination: page numbers {result.Current} → {result.Next}");
+            return NumberedPageResult.Advanced;
+        }
+
+        if (string.Equals(result.Reason, "last-page", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(result.Reason, "next-disabled", StringComparison.OrdinalIgnoreCase))
+            return NumberedPageResult.LastPage;
+
+        return NumberedPageResult.NotApplicable;
+    }
+
+    private static async Task<bool> TryClickNextControlAsync(IPage page, string selector)
+    {
+        var next = page.Locator(selector).First;
         if (await next.CountAsync() == 0)
             return false;
 
         try
         {
-            var disabled = await next.GetAttributeAsync("disabled");
-            var aria = await next.GetAttributeAsync("aria-disabled");
-            if (string.Equals(disabled, "true", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(aria, "true", StringComparison.OrdinalIgnoreCase))
+            if (await IsEffectivelyDisabledAsync(next))
                 return false;
 
             await next.ClickAsync(new LocatorClickOptions { Timeout = 15_000 });
-            await page.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
-            await page.WaitForTimeoutAsync(500);
             return true;
         }
         catch
@@ -297,6 +404,280 @@ public sealed class HarvestService
             return false;
         }
     }
+
+    private static async Task<bool> IsEffectivelyDisabledAsync(ILocator loc)
+    {
+        try
+        {
+            if (await loc.IsDisabledAsync())
+                return true;
+        }
+        catch
+        {
+        }
+
+        var disabled = await loc.GetAttributeAsync("disabled");
+        // HTML boolean attribute: present as "" or "disabled" or "true"
+        if (disabled != null)
+            return true;
+
+        var aria = await loc.GetAttributeAsync("aria-disabled");
+        if (string.Equals(aria, "true", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var cls = await loc.GetAttributeAsync("class") ?? "";
+        if (Regex.IsMatch(cls, @"\b(disabled|is-disabled|btn-disabled|pagination-disabled)\b", RegexOptions.IgnoreCase))
+            return true;
+
+        try
+        {
+            var parentDisabled = await loc.EvaluateAsync<bool>("""
+el => {
+  const p = el.closest('.disabled, .is-disabled, [aria-disabled="true"], [disabled]');
+  return !!p;
+}
+""");
+            if (parentDisabled)
+                return true;
+        }
+        catch
+        {
+        }
+
+        return false;
+    }
+
+    private static async Task<string> PageFingerprintAsync(IPage page)
+    {
+        try
+        {
+            return await page.EvaluateAsync<string>("""
+() => {
+  const href = location.href.split('#')[0];
+  const text = (document.body && (document.body.innerText || '')) || '';
+  const sample = text.replace(/\s+/g, ' ').trim().slice(0, 800);
+  return href + '|' + text.length + '|' + sample;
+}
+""") ?? page.Url;
+        }
+        catch
+        {
+            return page.Url;
+        }
+    }
+
+    private static string NormalizePageUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return "";
+        try
+        {
+            var u = new Uri(url);
+            var builder = new UriBuilder(u) { Fragment = "" };
+            return builder.Uri.ToString().TrimEnd('/');
+        }
+        catch
+        {
+            return url.Split('#')[0].TrimEnd('/');
+        }
+    }
+
+    private sealed class PaginationClickDto
+    {
+        public string? Mode { get; set; }
+        public bool Ok { get; set; }
+        public string? Reason { get; set; }
+        public int? Current { get; set; }
+        public int? Next { get; set; }
+    }
+
+    private const string NumberedPaginationScript = """
+(sel) => {
+  const PAGE_RE = /^\s*\d{1,4}\s*$/;
+  const CURRENT_RE = /\b(active|current|selected|is-active|is-current|is-selected|on|here)\b/i;
+
+  function textOf(el) {
+    return ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function pageNum(el) {
+    const t = textOf(el);
+    if (!PAGE_RE.test(t)) return null;
+    const n = parseInt(t, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
+  function clickTarget(el) {
+    if (!el) return null;
+    try {
+      if (el.matches && el.matches('a, button, [role="button"], [onclick]')) return el;
+    } catch (e) {}
+    const wrap = el.closest && el.closest('a, button, [role="button"]');
+    return wrap || el;
+  }
+
+  function isCurrent(el) {
+    if (!el) return false;
+    const cur = el.getAttribute && el.getAttribute('aria-current');
+    if (cur === 'page' || cur === 'true') return true;
+    if (el.getAttribute && el.getAttribute('aria-selected') === 'true') return true;
+    const cls = (el.className && String(el.className)) || '';
+    if (CURRENT_RE.test(cls)) return true;
+    const p = el.parentElement;
+    if (p) {
+      const pcls = (p.className && String(p.className)) || '';
+      if (CURRENT_RE.test(pcls)) return true;
+      const pcur = p.getAttribute && p.getAttribute('aria-current');
+      if (pcur === 'page' || pcur === 'true') return true;
+    }
+    return false;
+  }
+
+  function isDisabled(el) {
+    if (!el) return true;
+    if (el.disabled === true) return true;
+    if (el.getAttribute && el.getAttribute('disabled') != null) return true;
+    if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return true;
+    const cls = ((el.className && String(el.className)) || '') + ' ' +
+      ((el.parentElement && el.parentElement.className && String(el.parentElement.className)) || '');
+    if (/\b(disabled|is-disabled|btn-disabled)\b/i.test(cls)) return true;
+    return false;
+  }
+
+  let taught = null;
+  try { taught = document.querySelector(sel); } catch (e) {
+    return { mode: 'control', ok: false, reason: 'bad-selector' };
+  }
+  if (!taught) return { mode: 'control', ok: false, reason: 'missing' };
+
+  let best = null;
+  let node = taught;
+  for (let depth = 0; depth < 8 && node; depth++) {
+    const candidates = Array.from(node.querySelectorAll('a, button, span, li, div, em, strong'));
+    const byNum = new Map();
+    for (const c of candidates) {
+      const n = pageNum(c);
+      if (n == null) continue;
+      const target = clickTarget(c);
+      if (!target) continue;
+      const existing = byNum.get(n);
+      if (!existing || (target.tagName === 'A' && existing.tagName !== 'A'))
+        byNum.set(n, target);
+    }
+    if (byNum.size >= 2) {
+      best = byNum;
+      break;
+    }
+    node = node.parentElement;
+  }
+
+  if (!best) return { mode: 'control', ok: false };
+
+  let current = null;
+  for (const [n, el] of best.entries()) {
+    if (isCurrent(el)) { current = n; break; }
+  }
+
+  if (current == null) {
+    for (const [n, el] of best.entries()) {
+      let href = null;
+      try { href = el.href || (el.getAttribute && el.getAttribute('href')); } catch (e) {}
+      if (!href || href === '#' || /^javascript:/i.test(href)) continue;
+      try {
+        const abs = new URL(href, location.href);
+        const here = new URL(location.href);
+        if (abs.pathname === here.pathname && abs.search === here.search) {
+          current = n;
+          break;
+        }
+      } catch (e) {}
+    }
+  }
+
+  if (current == null) {
+    try {
+      const u = new URL(location.href);
+      for (const key of ['page', 'p', 'pg', 'sayfa']) {
+        const v = u.searchParams.get(key);
+        if (v && /^\d+$/.test(v)) {
+          const n = parseInt(v, 10);
+          if (n === 0 && best.has(1)) { current = 1; break; }
+          if (best.has(n)) { current = n; break; }
+        }
+      }
+      if (current == null) {
+        const m = location.pathname.match(/\/(?:page|sayfa|p)\/(\d+)/i);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          if (best.has(n)) current = n;
+        }
+      }
+      if (current == null) {
+        const hits = [];
+        for (const n of best.keys()) {
+          const re = new RegExp('(?:[?&](?:page|p|pg|sayfa)=|/(?:page|p|sayfa)/)' + n + '(?:\\D|$)', 'i');
+          if (re.test(location.href)) hits.push(n);
+        }
+        if (hits.length === 1) current = hits[0];
+        else if (hits.length > 1) current = Math.max(...hits);
+      }
+    } catch (e) {}
+  }
+
+  if (current == null) {
+    for (const [n, el] of best.entries()) {
+      if (el.tagName !== 'A' && el.tagName !== 'BUTTON') { current = n; break; }
+    }
+  }
+
+  // First listing page often has no active marker and no page= in the URL.
+  if (current == null && best.has(1)
+      && !/[?&](?:page|p|pg|sayfa)=|[\/](?:page|p|sayfa)\/\d+/i.test(location.href)) {
+    current = 1;
+  }
+
+  if (current == null)
+    return { mode: 'control', ok: false, reason: 'unknown-current' };
+
+  const nextNum = current + 1;
+  if (best.has(nextNum)) {
+    const nextEl = best.get(nextNum);
+    if (isDisabled(nextEl))
+      return { mode: 'numbers', ok: false, reason: 'next-disabled', current, next: nextNum };
+    nextEl.click();
+    return { mode: 'numbers', ok: true, current, next: nextNum };
+  }
+
+  // Sliding window (e.g. 8 9 10 … 20): page N+1 may be off-screen — use nearby next arrow.
+  const arrow = findNextArrow(node || taught.parentElement || taught);
+  if (arrow && !isDisabled(arrow)) {
+    arrow.click();
+    return { mode: 'numbers', ok: true, current, next: nextNum };
+  }
+
+  return { mode: 'numbers', ok: false, reason: 'last-page', current, next: nextNum };
+
+  function findNextArrow(root) {
+    if (!root) return null;
+    const scope = root.closest
+      ? (root.closest('nav, .pagination, .pager, ul, ol, div') || root)
+      : root;
+    const nodes = Array.from(scope.querySelectorAll('a, button, [role="button"], span'));
+    const nextRe = /^(next|sonraki|ileri|›|»|→|>|>>)$/i;
+    const labelRe = /\b(next|sonraki|ileri)\b/i;
+    for (const el of nodes) {
+      const t = textOf(el);
+      const label = ((el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title'))) || '');
+      const rel = ((el.getAttribute && el.getAttribute('rel')) || '').toLowerCase();
+      if (rel === 'next' || nextRe.test(t) || labelRe.test(label)) {
+        const target = clickTarget(el);
+        if (target && pageNum(target) == null) return target;
+      }
+    }
+    return null;
+  }
+}
+""";
 
     private static bool ReachedMax(List<HarvestItem> items, int? maxItems) =>
         maxItems is > 0 && items.Count >= maxItems.Value;

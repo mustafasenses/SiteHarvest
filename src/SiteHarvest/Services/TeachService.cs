@@ -292,7 +292,7 @@ public sealed class TeachService
     {
         yield return new MenuItem(MenuAction.AddClick, "Add click", "page or card");
         yield return new MenuItem(MenuAction.AddField, "Add field", "text / image / url");
-        yield return new MenuItem(MenuAction.MarkNextPage, "Mark next page", "go to next page");
+        yield return new MenuItem(MenuAction.MarkNextPage, "Mark next page", "next arrow or a page number");
 
         if (auto.HasPagination)
             yield return new MenuItem(MenuAction.ClearNextPage, "Clear next page", "");
@@ -397,13 +397,13 @@ public sealed class TeachService
         Func<string, TimeSpan, CancellationToken, Task<PickEvent>> waitPick,
         CancellationToken ct)
     {
-        Term.InfoMsg("Click the next-page control…");
+        Term.InfoMsg("Click next (›) or any page number in the pager (e.g. 2)…");
         await InjectPickerAsync(page, "next");
         var nextEv = await waitPick("next", TimeSpan.FromMinutes(5), ct);
         await InjectPickerAsync(page, "idle");
         auto.HasPagination = true;
         auto.NextPageSelector = nextEv.Selector;
-        Term.Success($"Next page marked → {Truncate(nextEv.Selector!, 70)}");
+        Term.Success($"Pagination marked → {Truncate(nextEv.Selector!, 70)}");
         return true;
     }
 

@@ -16,7 +16,7 @@ Catalog-style sites (product grids, listing pages, multi-step menus) often need 
 
 - Arrow-key menu for every action (sites, automations, teach, run, export)
 - Teach mode: add clicks and fields yourself; clear “repeat for every item?” prompt
-- Pagination via a recorded “next” control
+- Pagination via a recorded next control or page-number pager (stops when the last page is reached)
 - Field types: `text`, `image`, `url`
 - Runs under `data/runs/{id}/` with exportable zip
 - UTF-8 JSON (non-ASCII characters written literally)
@@ -52,7 +52,7 @@ Optional data directory: `--data /path/to/data` or env `SITE_HARVEST_DATA`.
 
 ## Teach
 
-Teach opens a headed browser and a simple arrow-key menu: add clicks, fields, or a next-page control.
+Teach opens a headed browser and a simple arrow-key menu: add clicks, fields, or pagination (next arrow **or** a page number such as `2`).
 
 After each **Add click**, you’re asked:
 
