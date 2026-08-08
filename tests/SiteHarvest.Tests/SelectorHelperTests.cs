@@ -93,4 +93,19 @@ public class SelectorHelperTests
             "section#collection-detail-list > div.section-content.p2x > div.collection-detail > div.collection-product-wrapper > div.collection-product-list > div.item",
             card);
     }
+
+    [Theory]
+    [InlineData("img#s30x60", "img[id]")]
+    [InlineData("p#y30x60", "p[id]")]
+    [InlineData("img.hero", null)]
+    [InlineData("#main-photo", "*[id]")]
+    public void RelaxSpecificId_strips_brittle_element_id(string input, string? expected) =>
+        Assert.Equal(expected, SelectorHelper.RelaxSpecificId(input));
+
+    [Fact]
+    public void SelectorCandidates_includes_relaxed_id()
+    {
+        var candidates = SelectorHelper.SelectorCandidates("img#s30x60");
+        Assert.Equal(new[] { "img#s30x60", "img[id]" }, candidates);
+    }
 }

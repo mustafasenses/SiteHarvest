@@ -758,8 +758,7 @@ el => {
             string.Equals(f.Type, FieldTypes.Image, StringComparison.OrdinalIgnoreCase));
         if (imageField != null)
         {
-            var prepareSel = SelectorHelper.GeneralizeListSelector(imageField.Selector)
-                             ?? imageField.Selector;
+            var prepareSel = await FirstMatchingSelectorAsync(page, imageField.Selector) ?? imageField.Selector;
             await PrepareMediaAsync(page, prepareSel, ct);
         }
 
@@ -777,43 +776,47 @@ el => {
             }
         }
 
-        // Fallback: generalized image field matches (taught image selector).
+        // Fallback: generalized image field matches (taught selector, then relaxed #id).
         if (imageField != null)
         {
-            var imageSelector = SelectorHelper.GeneralizeListSelector(imageField.Selector)
-                                ?? imageField.Selector;
-            var locators = page.Locator(imageSelector);
-            var count = await locators.CountAsync();
-            if (count > 1)
+            var imageSelector = await FirstMatchingSelectorAsync(page, imageField.Selector);
+            if (imageSelector != null)
             {
-                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                for (var i = 0; i < count; i++)
+                var locators = page.Locator(imageSelector);
+                var count = await locators.CountAsync();
+                if (count > 1)
                 {
-                    if (ReachedMax(items, maxItems))
-                        break;
-                    ct.ThrowIfCancellationRequested();
-
-                    var loc = locators.Nth(i);
-                    try
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    for (var i = 0; i < count; i++)
                     {
-                        await loc.ScrollIntoViewIfNeededAsync();
-                        await WaitForLocatorImageReadyAsync(loc, ct, timeoutMs: 8_000);
-                    }
-                    catch
-                    {
+                        if (ReachedMax(items, maxItems))
+                            break;
+                        ct.ThrowIfCancellationRequested();
+
+                        var loc = locators.Nth(i);
+                        try
+                        {
+                            await loc.ScrollIntoViewIfNeededAsync();
+                            await WaitForLocatorImageReadyAsync(loc, ct, timeoutMs: 8_000);
+                        }
+                        catch
+                        {
+                        }
+
+                        await CaptureOneAsync(
+                            page, auto, run, items, $"{visitKey}:{i}", i, loc, maxItems, ct, seen);
                     }
 
-                    await CaptureOneAsync(
-                        page, auto, run, items, $"{visitKey}:{i}", i, loc, maxItems, ct, seen);
+                    return;
                 }
-
-                return;
             }
         }
 
         // Fallback: each match of the first taught field = one item.
         var driver = auto.Fields[0];
-        var driverSel = SelectorHelper.GeneralizeListSelector(driver.Selector) ?? driver.Selector;
+        var driverSel = await FirstMatchingSelectorAsync(page, driver.Selector)
+                        ?? SelectorHelper.GeneralizeListSelector(driver.Selector)
+                        ?? driver.Selector;
         var driverLocs = page.Locator(driverSel);
         var driverCount = await driverLocs.CountAsync();
         if (driverCount > 1)
@@ -824,6 +827,23 @@ el => {
         }
 
         await CaptureOneAsync(page, auto, run, items, visitKey, 0, cardRoot: null, maxItems, ct);
+    }
+
+    private static async Task<string?> FirstMatchingSelectorAsync(IPage page, string? taughtSelector)
+    {
+        foreach (var candidate in SelectorHelper.SelectorCandidates(taughtSelector))
+        {
+            try
+            {
+                if (await page.Locator(candidate).CountAsync() > 0)
+                    return candidate;
+            }
+            catch
+            {
+            }
+        }
+
+        return SelectorHelper.GeneralizeListSelector(taughtSelector) ?? SelectorHelper.Sanitize(taughtSelector);
     }
 
     private async Task CaptureEachAsync(
@@ -971,12 +991,18 @@ el => {
 
     private static async Task<string?> ExtractFromPageAsync(IPage page, FieldMapping field, string pageUrl)
     {
-        var selector = SelectorHelper.GeneralizeListSelector(field.Selector) ?? field.Selector;
-        var loc = page.Locator(selector).First;
-        if (await loc.CountAsync() == 0)
-            return null;
+        foreach (var selector in SelectorHelper.SelectorCandidates(field.Selector))
+        {
+            var loc = page.Locator(selector).First;
+            if (await loc.CountAsync() == 0)
+                continue;
 
-        return await ReadLocatorAsync(loc, field.Type, pageUrl);
+            var value = await ReadLocatorAsync(loc, field.Type, pageUrl);
+            if (!string.IsNullOrWhiteSpace(value))
+                return value;
+        }
+
+        return null;
     }
 
     private static async Task<string?> ExtractFromCardRootAsync(
@@ -985,21 +1011,47 @@ el => {
         string pageUrl)
     {
         // Prefer leaf selector scoped to this card (full page paths never match inside a card).
-        var leaf = SelectorHelper.LeafSelector(field.Selector);
-        if (!string.IsNullOrWhiteSpace(leaf))
+        foreach (var candidate in SelectorHelper.SelectorCandidates(field.Selector))
         {
+            var leaf = SelectorHelper.LeafSelector(candidate) ?? candidate;
+            if (string.IsNullOrWhiteSpace(leaf))
+                continue;
+
             var loc = cardRoot.Locator(leaf).First;
             if (await loc.CountAsync() > 0)
-                return await ReadLocatorAsync(loc, field.Type, pageUrl);
+            {
+                var value = await ReadLocatorAsync(loc, field.Type, pageUrl);
+                if (!string.IsNullOrWhiteSpace(value))
+                    return value;
+            }
 
-            // Card root may already be the field node (LCP ended at the leaf).
+            // Sibling fields often sit under the same card parent (img + p).
+            try
+            {
+                var parentLoc = cardRoot.Locator("xpath=..").Locator(leaf).First;
+                if (await parentLoc.CountAsync() > 0)
+                {
+                    var value = await ReadLocatorAsync(parentLoc, field.Type, pageUrl);
+                    if (!string.IsNullOrWhiteSpace(value))
+                        return value;
+                }
+            }
+            catch
+            {
+            }
+
+            // Card root may already be the field node.
             try
             {
                 var isSelf = await cardRoot.EvaluateAsync<bool>(
                     "(el, sel) => { try { return el.matches(sel); } catch (e) { return false; } }",
                     leaf);
                 if (isSelf)
-                    return await ReadLocatorAsync(cardRoot, field.Type, pageUrl);
+                {
+                    var value = await ReadLocatorAsync(cardRoot, field.Type, pageUrl);
+                    if (!string.IsNullOrWhiteSpace(value))
+                        return value;
+                }
             }
             catch
             {
@@ -1014,20 +1066,25 @@ el => {
         FieldMapping field,
         string pageUrl)
     {
-        var leaf = SelectorHelper.LeafSelector(field.Selector) ?? field.Selector;
-        var payload = await cardRoot.EvaluateAsync<CardExtractDto?>(
-            CardScopedScript,
-            new { selector = field.Selector, leaf, type = field.Type });
-
-        if (payload == null)
-            return null;
-
-        return field.Type.ToLowerInvariant() switch
+        foreach (var candidate in SelectorHelper.SelectorCandidates(field.Selector))
         {
-            FieldTypes.Image => UrlHelper.ToAbsolute(payload.Value, pageUrl) ?? payload.Value,
-            FieldTypes.Url => UrlHelper.ToAbsolute(payload.Value, pageUrl) ?? payload.Value,
-            _ => payload.Value,
-        };
+            var leaf = SelectorHelper.LeafSelector(candidate) ?? candidate;
+            var payload = await cardRoot.EvaluateAsync<CardExtractDto?>(
+                CardScopedScript,
+                new { selector = candidate, leaf, type = field.Type });
+
+            if (payload?.Value == null || string.IsNullOrWhiteSpace(payload.Value))
+                continue;
+
+            return field.Type.ToLowerInvariant() switch
+            {
+                FieldTypes.Image => UrlHelper.ToAbsolute(payload.Value, pageUrl) ?? payload.Value,
+                FieldTypes.Url => UrlHelper.ToAbsolute(payload.Value, pageUrl) ?? payload.Value,
+                _ => payload.Value,
+            };
+        }
+
+        return null;
     }
 
     private static async Task<string?> ReadLocatorAsync(ILocator loc, string type, string pageUrl)
@@ -1200,6 +1257,15 @@ el => {
         CancellationToken ct,
         int timeoutMs)
     {
+        // If nothing matches the taught selector or relaxed-id fallback, fail fast.
+        if (cardRoot == null)
+        {
+            var matched = await FirstMatchingSelectorAsync(page, field.Selector);
+            if (matched == null
+                || await page.Locator(matched).CountAsync() == 0)
+                return null;
+        }
+
         var deadline = DateTimeOffset.UtcNow.AddMilliseconds(timeoutMs);
         string? last = null;
 
@@ -1224,6 +1290,10 @@ el => {
                 await WaitForLocatorImageReadyAsync(
                     cardRoot, ct, timeoutMs: Math.Min(ImageReadyPollMs * 8, 2_000));
             }
+            else
+            {
+                return null;
+            }
 
             last = cardRoot != null
                 ? await ExtractFromCardRootAsync(cardRoot, field, pageUrl)
@@ -1247,22 +1317,47 @@ el => {
         {
             if (cardRoot != null)
             {
-                var leaf = SelectorHelper.LeafSelector(field.Selector);
-                if (!string.IsNullOrWhiteSpace(leaf))
+                foreach (var candidate in SelectorHelper.SelectorCandidates(field.Selector))
                 {
+                    var leaf = SelectorHelper.LeafSelector(candidate) ?? candidate;
                     var scoped = cardRoot.Locator(leaf).First;
                     if (await scoped.CountAsync() > 0)
                         return scoped;
+
+                    try
+                    {
+                        var sibling = cardRoot.Locator("xpath=..").Locator(leaf).First;
+                        if (await sibling.CountAsync() > 0)
+                            return sibling;
+                    }
+                    catch
+                    {
+                    }
                 }
 
                 var nested = cardRoot.Locator("img").First;
                 if (await nested.CountAsync() > 0)
                     return nested;
 
-                return cardRoot;
+                // cardRoot itself may be the image node.
+                try
+                {
+                    var isImg = await cardRoot.EvaluateAsync<bool>(
+                        "el => !!(el && el.tagName === 'IMG')");
+                    if (isImg)
+                        return cardRoot;
+                }
+                catch
+                {
+                }
+
+                return null;
             }
 
-            var selector = SelectorHelper.GeneralizeListSelector(field.Selector) ?? field.Selector;
+            var selector = await FirstMatchingSelectorAsync(page, field.Selector);
+            if (selector == null)
+                return null;
+
             var loc = page.Locator(selector).First;
             return await loc.CountAsync() > 0 ? loc : null;
         }

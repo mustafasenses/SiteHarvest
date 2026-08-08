@@ -101,6 +101,61 @@ public static class SelectorHelper
                || selector.Contains(":nth-child(", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// If the leaf pins a specific element id (e.g. img#hero-3), return tag[id] so
+    /// harvest can match peer elements when that exact id is missing on some pages.
+    /// Not domain-specific — only relaxes brittle #id targeting.
+    /// </summary>
+    public static string? RelaxSpecificId(string? selector)
+    {
+        var leaf = LeafSelector(selector) ?? Sanitize(selector);
+        if (leaf == null)
+            return null;
+
+        var m = Regex.Match(
+            leaf,
+            @"^(?<tag>[a-zA-Z][\w-]*)?#(?<id>[\w-]+)$",
+            RegexOptions.IgnoreCase);
+        if (!m.Success)
+            return null;
+
+        var tag = m.Groups["tag"].Success && m.Groups["tag"].Length > 0
+            ? m.Groups["tag"].Value
+            : "*";
+        return $"{tag}[id]";
+    }
+
+    /// <summary>
+    /// Primary generalized selector, then optional relaxed-id candidate.
+    /// </summary>
+    public static IReadOnlyList<string> SelectorCandidates(string? selector)
+    {
+        var list = new List<string>();
+        var primary = GeneralizeListSelector(selector) ?? Sanitize(selector);
+        if (primary != null)
+            list.Add(primary);
+
+        var leafFb = RelaxSpecificId(selector);
+        if (leafFb == null)
+            return list;
+
+        var parts = SplitPath(primary ?? selector ?? "");
+        string candidate;
+        if (parts.Length <= 1)
+            candidate = leafFb;
+        else
+        {
+            var head = parts.Take(parts.Length - 1)
+                .Select(p => GeneralizeListSelector(p) ?? p);
+            candidate = string.Join(" > ", head.Append(leafFb));
+        }
+
+        if (!list.Exists(s => string.Equals(s, candidate, StringComparison.OrdinalIgnoreCase)))
+            list.Add(candidate);
+
+        return list;
+    }
+
     private static string[] SplitPath(string selector) =>
         selector.Split('>', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
 
