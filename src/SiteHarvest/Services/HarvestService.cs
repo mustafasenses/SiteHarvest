@@ -147,13 +147,23 @@ public sealed class HarvestService
                 string? href = null;
                 try
                 {
-                    href = await card.GetAttributeAsync("href");
-                    if (string.IsNullOrWhiteSpace(href))
-                    {
-                        var link = card.Locator("a[href]").First;
-                        if (await link.CountAsync() > 0)
-                            href = await link.GetAttributeAsync("href");
-                    }
+                    // Card may be an inner node (e.g. img); prefer closest ancestor link.
+                    href = await card.EvaluateAsync<string?>("""
+el => {
+  if (!el) return null;
+  try {
+    if (el.tagName === 'A') {
+      const h = el.getAttribute('href');
+      if (h && h !== '#' && !/^javascript:/i.test(h)) return el.href || h;
+    }
+    const a = el.closest && el.closest('a[href]');
+    if (!a) return null;
+    const h = a.getAttribute('href');
+    if (!h || h === '#' || /^javascript:/i.test(h)) return null;
+    return a.href || h;
+  } catch (e) { return null; }
+}
+""");
                 }
                 catch
                 {
@@ -887,7 +897,10 @@ el => {
                     }
 
                     if (seenImageUrls != null && !seenImageUrls.Add(extracted))
+                    {
+                        Console.WriteLine($"  Field '{field.Key}': duplicate image URL, skipping item.");
                         return;
+                    }
 
                     anchor ??= extracted;
                     var local = await DownloadImageAsync(extracted, pageUrl, run.Id, field.Key, cardIndex, ct);
@@ -901,7 +914,10 @@ el => {
                             if (seenImageUrls != null
                                 && !string.Equals(retryUrl, extracted, StringComparison.OrdinalIgnoreCase)
                                 && !seenImageUrls.Add(retryUrl))
+                            {
+                                Console.WriteLine($"  Field '{field.Key}': duplicate image URL, skipping item.");
                                 return;
+                            }
 
                             extracted = retryUrl;
                             anchor = extracted;
@@ -1050,18 +1066,27 @@ el => {
     {
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, absoluteUrl);
+            var downloadUrl = EncodeDownloadUrl(absoluteUrl);
+            using var req = new HttpRequestMessage(HttpMethod.Get, downloadUrl);
             req.Headers.TryAddWithoutValidation("Referer", pageUrl);
             req.Headers.TryAddWithoutValidation("User-Agent", "site-harvest/1.0");
             using var res = await Http.SendAsync(req, ct);
             if (!res.IsSuccessStatusCode)
                 return null;
 
+            var mediaType = res.Content.Headers.ContentType?.MediaType;
+            if (mediaType != null
+                && mediaType.StartsWith("text/", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"  Image download got non-image content-type ({mediaType}): {absoluteUrl}");
+                return null;
+            }
+
             var bytes = await res.Content.ReadAsByteArrayAsync(ct);
             if (bytes.Length == 0)
                 return null;
 
-            var ext = GuessExt(res.Content.Headers.ContentType?.MediaType, absoluteUrl);
+            var ext = GuessExt(mediaType, absoluteUrl);
             var safeKey = SanitizeFilePart(fieldKey);
             var fileName = $"{safeKey}_{index}_{Guid.NewGuid().ToString("N")[..8]}{ext}";
             var path = Path.Combine(_store.RunMediaDir(runId), fileName);
@@ -1073,6 +1098,26 @@ el => {
             Console.WriteLine($"  Image download failed ({absoluteUrl}): {ex.Message}");
             return null;
         }
+    }
+
+    private static string EncodeDownloadUrl(string absoluteUrl)
+    {
+        // Product CDNs often leave spaces in paths (e.g. "01 CONCRETE/...").
+        if (string.IsNullOrWhiteSpace(absoluteUrl))
+            return absoluteUrl;
+
+        if (!Uri.TryCreate(absoluteUrl, UriKind.Absolute, out var uri))
+            return absoluteUrl.Replace(" ", "%20", StringComparison.Ordinal);
+
+        var builder = new UriBuilder(uri)
+        {
+            Path = string.Join("/",
+                uri.AbsolutePath.Split('/', StringSplitOptions.None)
+                    .Select(segment => segment.Contains('%', StringComparison.Ordinal)
+                        ? segment
+                        : Uri.EscapeDataString(Uri.UnescapeDataString(segment)))),
+        };
+        return builder.Uri.AbsoluteUri;
     }
 
     private static string GuessExt(string? mediaType, string url)
@@ -1087,8 +1132,15 @@ el => {
                 return ".jpg";
         }
 
-        var ext = Path.GetExtension(new Uri(url).AbsolutePath);
-        return string.IsNullOrWhiteSpace(ext) ? ".jpg" : ext.Split('?')[0];
+        try
+        {
+            var ext = Path.GetExtension(new Uri(url).AbsolutePath);
+            return string.IsNullOrWhiteSpace(ext) ? ".jpg" : ext.Split('?')[0];
+        }
+        catch (UriFormatException)
+        {
+            return ".jpg";
+        }
     }
 
     private static string SanitizeFilePart(string value)
@@ -1269,6 +1321,18 @@ el => {
       return true;
     return false;
   }
+  // Empty <img data-src> often exposes location.href via img.src — treat as unloaded.
+  function isBadSrc(url) {
+    if (isPlaceholder(url)) return true;
+    try {
+      const abs = new URL(url, location.href);
+      if (abs.href === location.href) return true;
+      if (abs.origin === location.origin && abs.pathname === location.pathname
+          && !/\.(jpe?g|png|gif|webp|svg|avif)(\?|$)/i.test(abs.pathname))
+        return true;
+    } catch (e) {}
+    return false;
+  }
   function fromSrcset(value) {
     if (!value || typeof value !== 'string') return null;
     const first = value.split(',')[0]?.trim().split(/\s+/)[0];
@@ -1290,20 +1354,21 @@ el => {
   }
   function pickUrl(img) {
     if (!img) return null;
+    // Prefer lazy attrs first — sites like guralseramik only set data-src.
     const candidates = [
-      img.currentSrc, img.src,
       ...lazyCandidates(img),
       fromSrcset(img.getAttribute('srcset')),
+      img.currentSrc, img.src,
     ];
     for (const c of candidates) {
-      if (c && typeof c === 'string' && !isPlaceholder(c)) return c.trim();
+      if (c && typeof c === 'string' && !isBadSrc(c)) return c.trim();
     }
     return null;
   }
   function promoteLazy(img) {
     if (!img) return;
     for (const lazy of lazyCandidates(img)) {
-      if (lazy && !isPlaceholder(lazy) && isPlaceholder(img.getAttribute('src') || img.src || '')) {
+      if (lazy && !isBadSrc(lazy) && isBadSrc(img.getAttribute('src') || img.src || '')) {
         try { img.src = lazy; break; } catch (e) {}
       }
     }
@@ -1358,22 +1423,33 @@ el => {
       fromSrcset(img.getAttribute('data-lazy-srcset')),
     ];
   }
+  function isBadSrc(url) {
+    if (isPlaceholder(url)) return true;
+    try {
+      const abs = new URL(url, location.href);
+      if (abs.href === location.href) return true;
+      if (abs.origin === location.origin && abs.pathname === location.pathname
+          && !/\.(jpe?g|png|gif|webp|svg|avif)(\?|$)/i.test(abs.pathname))
+        return true;
+    } catch (e) {}
+    return false;
+  }
   function pickUrl(img) {
     if (!img) return null;
     const candidates = [
-      img.currentSrc, img.src,
       ...lazyCandidates(img),
       fromSrcset(img.getAttribute('srcset')),
+      img.currentSrc, img.src,
     ];
     for (const c of candidates) {
-      if (c && typeof c === 'string' && !isPlaceholder(c)) return c.trim();
+      if (c && typeof c === 'string' && !isBadSrc(c)) return c.trim();
     }
     return null;
   }
   const img = resolveImg(el);
   if (!img) return false;
   for (const lazy of lazyCandidates(img)) {
-    if (lazy && !isPlaceholder(lazy) && isPlaceholder(img.getAttribute('src') || img.src || '')) {
+    if (lazy && !isBadSrc(lazy) && isBadSrc(img.getAttribute('src') || img.src || '')) {
       try { img.src = lazy; break; } catch (e) {}
     }
   }
@@ -1392,6 +1468,17 @@ el => {
     const base = path.substring(path.lastIndexOf('/') + 1).toLowerCase();
     if (!base) return true;
     return /^(spacer|pixel|blank|placeholder|loading|transparent|lazy[-_]?load|1x1)(\.|$)/i.test(base);
+  }
+  function isBadSrc(url) {
+    if (isPlaceholder(url)) return true;
+    try {
+      const abs = new URL(url, location.href);
+      if (abs.href === location.href) return true;
+      if (abs.origin === location.origin && abs.pathname === location.pathname
+          && !/\.(jpe?g|png|gif|webp|svg|avif)(\?|$)/i.test(abs.pathname))
+        return true;
+    } catch (e) {}
+    return false;
   }
   function fromSrcset(value) {
     if (!value || typeof value !== 'string') return null;
@@ -1412,7 +1499,7 @@ el => {
       || img.getAttribute('data-image')
       || fromSrcset(img.getAttribute('data-srcset'))
       || fromSrcset(img.getAttribute('data-lazy-srcset'));
-    if (lazy && !isPlaceholder(lazy) && isPlaceholder(img.getAttribute('src') || img.src || '')) {
+    if (lazy && !isBadSrc(lazy) && isBadSrc(img.getAttribute('src') || img.src || '')) {
       try { img.src = lazy; promoted++; } catch (e) {}
     }
   }
@@ -1472,6 +1559,17 @@ el => {
       return true;
     return false;
   }
+  function isBadSrc(url) {
+    if (isPlaceholder(url)) return true;
+    try {
+      const abs = new URL(url, location.href);
+      if (abs.href === location.href) return true;
+      if (abs.origin === location.origin && abs.pathname === location.pathname
+          && !/\.(jpe?g|png|gif|webp|svg|avif)(\?|$)/i.test(abs.pathname))
+        return true;
+    } catch (e) {}
+    return false;
+  }
   function fromSrcset(value) {
     if (!value || typeof value !== 'string') return null;
     return value.split(',')[0]?.trim().split(/\s+/)[0] || null;
@@ -1490,17 +1588,17 @@ el => {
       fromSrcset(img.getAttribute('data-lazy-srcset')),
     ];
     for (const lazy of lazyList) {
-      if (lazy && !isPlaceholder(lazy) && isPlaceholder(img.getAttribute('src') || img.src || '')) {
+      if (lazy && !isBadSrc(lazy) && isBadSrc(img.getAttribute('src') || img.src || '')) {
         try { img.src = lazy; break; } catch (e) {}
       }
     }
     const candidates = [
-      img.currentSrc, img.src,
       ...lazyList,
       fromSrcset(img.getAttribute('srcset')),
+      img.currentSrc, img.src,
     ];
     for (const c of candidates) {
-      if (c && typeof c === 'string' && !isPlaceholder(c)) return c.trim();
+      if (c && typeof c === 'string' && !isBadSrc(c)) return c.trim();
     }
     return null;
   }

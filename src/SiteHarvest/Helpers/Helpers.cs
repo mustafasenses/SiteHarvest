@@ -36,41 +36,59 @@ public static class SelectorHelper
     }
 
     /// <summary>
-    /// Infer a repeating card root from taught field selector paths only.
-    /// Uses the longest common prefix; requires an :nth-* in teaching so list pages
-    /// are detected from recorded structure, not from class-name guesses.
+    /// Infer a repeating card root from taught field selector paths.
+    /// Prefers the deepest :nth-* ancestor (not the leaf field), so mixed prefixes
+    /// (e.g. section#… vs div.section-content…) and page-level fields (h4) still
+    /// resolve to the repeating item container.
     /// </summary>
     public static string? InferRepeatingCardSelector(IEnumerable<string?> fieldSelectors)
     {
-        var paths = fieldSelectors
-            .Select(Sanitize)
-            .Where(s => s != null)
-            .Select(s => SplitPath(s!))
-            .Where(p => p.Length > 0)
-            .ToList();
-        if (paths.Count == 0)
-            return null;
+        string? best = null;
+        var bestDepth = 0;
 
-        // Only treat as a list when teaching left an nth index on at least one path.
-        if (!paths.Any(p => p.Any(HasNthIndex)))
-            return null;
-
-        var minLen = paths.Min(p => p.Length);
-        var lcp = new List<string>();
-        for (var i = 0; i < minLen; i++)
+        foreach (var raw in fieldSelectors)
         {
-            var generalized = GeneralizeListSelector(paths[0][i]);
-            if (generalized == null
-                || paths.Any(p => GeneralizeListSelector(p[i]) != generalized))
-                break;
-            lcp.Add(generalized);
+            var parts = SplitPath(Sanitize(raw) ?? "");
+            if (parts.Length < 2)
+                continue;
+
+            // Prefer nth on a non-leaf segment (the card), not the taught field leaf.
+            var nthIdx = -1;
+            for (var i = 0; i < parts.Length - 1; i++)
+            {
+                if (HasNthIndex(parts[i]))
+                    nthIdx = i;
+            }
+
+            if (nthIdx < 0)
+                continue;
+
+            var cardParts = new List<string>();
+            var ok = true;
+            for (var i = 0; i <= nthIdx; i++)
+            {
+                var g = GeneralizeListSelector(parts[i]);
+                if (g == null)
+                {
+                    ok = false;
+                    break;
+                }
+
+                cardParts.Add(g);
+            }
+
+            if (!ok || cardParts.Count < 2)
+                continue;
+
+            if (cardParts.Count > bestDepth
+                || (cardParts.Count == bestDepth && string.Join(" > ", cardParts).Length > (best?.Length ?? 0)))
+            {
+                bestDepth = cardParts.Count;
+                best = string.Join(" > ", cardParts);
+            }
         }
 
-        // Too short (e.g. just "div") is unsafe to iterate as cards.
-        if (lcp.Count < 2)
-            return null;
-
-        return string.Join(" > ", lcp);
+        return best;
     }
 
     /// <summary>

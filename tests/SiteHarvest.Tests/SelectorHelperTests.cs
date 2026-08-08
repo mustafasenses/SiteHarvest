@@ -46,7 +46,7 @@ public class SelectorHelperTests
         Assert.Equal(expected, SelectorHelper.LeafSelector(input));
 
     [Fact]
-    public void InferRepeatingCardSelector_uses_longest_common_prefix()
+    public void InferRepeatingCardSelector_uses_nth_card_ancestor()
     {
         var card = SelectorHelper.InferRepeatingCardSelector(new[]
         {
@@ -59,13 +59,13 @@ public class SelectorHelperTests
     }
 
     [Fact]
-    public void InferRepeatingCardSelector_single_field_keeps_leaf_path()
+    public void InferRepeatingCardSelector_single_field_stops_at_card()
     {
         var card = SelectorHelper.InferRepeatingCardSelector(new[]
         {
             "div.list > div:nth-of-type(1).row > a > p.title",
         });
-        Assert.Equal("div.list > div.row > a > p.title", card);
+        Assert.Equal("div.list > div.row", card);
     }
 
     [Fact]
@@ -77,5 +77,20 @@ public class SelectorHelperTests
             "main > article > p",
         });
         Assert.Null(card);
+    }
+
+    [Fact]
+    public void InferRepeatingCardSelector_ignores_page_level_field_without_nth()
+    {
+        // Mirrors guralseramik: name/image are per-item; size (h4) is once per group.
+        var card = SelectorHelper.InferRepeatingCardSelector(new[]
+        {
+            "section#collection-detail-list > div.section-content.p2x > div.collection-detail > div.collection-product-wrapper > div.collection-product-list > div:nth-of-type(1).item > a > p",
+            "div.section-content.p2x > div.collection-detail > div.collection-product-wrapper > div.collection-product-list > div:nth-of-type(1).item > a > span.img.r260x260 > img",
+            "section#collection-detail-list > div.section-content.p2x > div.collection-detail > div.collection-product-wrapper > h4",
+        });
+        Assert.Equal(
+            "section#collection-detail-list > div.section-content.p2x > div.collection-detail > div.collection-product-wrapper > div.collection-product-list > div.item",
+            card);
     }
 }
